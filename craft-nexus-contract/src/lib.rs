@@ -1,10 +1,46 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, Env, String, Symbol,
     token,
 };
 
 mod test;
+// Onboarding is a separate logical contract; only one `#[contract]` may be linked per WASM
+// artifact. Keep it in this crate for host tests (`cargo test`) but omit from guest builds.
+#[cfg(not(target_family = "wasm"))]
+pub mod onboarding;
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Error {
+    /// Unauthorized operation
+    Unauthorized = 1,
+    /// Escrow not found
+    EscrowNotFound = 2,
+    /// Invalid escrow state for operation
+    InvalidEscrowState = 3,
+    /// Username already exists
+    UsernameAlreadyExists = 4,
+    /// Token not whitelisted
+    TokenNotWhitelisted = 5,
+    /// Amount below minimum
+    AmountBelowMinimum = 6,
+    /// Release window too long
+    ReleaseWindowTooLong = 7,
+    /// Not in dispute state
+    NotInDispute = 8,
+    /// User already onboarded
+    AlreadyOnboarded = 9,
+    /// Invalid fee amount
+    InvalidFee = 10,
+    /// Buyer and seller cannot be the same
+    SameBuyerSeller = 11,
+    /// Platform not initialized
+    PlatformNotInitialized = 12,
+    /// Release window not yet elapsed
+    ReleaseWindowNotElapsed = 13,
+}
 
 const ESCROW: Symbol = symbol_short!("ESCROW");
 const PLATFORM_FEE: Symbol = symbol_short!("PLAT_FEE");
@@ -16,6 +52,14 @@ const ADMIN: Symbol = symbol_short!("ADMIN");
 const DEFAULT_PLATFORM_FEE_BPS: u32 = 500;
 /// Maximum platform fee in basis points (10000 = 100%)
 const MAX_PLATFORM_FEE_BPS: u32 = 1000; // 10% max
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Escrow(u32),
+    BuyerEscrows(Address),
+    SellerEscrows(Address),
+}
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -37,13 +81,16 @@ pub enum Resolution {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Escrow {
+    pub id: u64,
     pub buyer: Address,
     pub seller: Address,
     pub token: Address,
     pub amount: i128,
     pub status: EscrowStatus,
-    pub created_at: u64,
-    pub release_window: u64, // Time in seconds before auto-release
+    pub release_window: u32, // Time in seconds before auto-release
+    pub created_at: u32,
+    pub ipfs_hash: Option<String>,
+    pub metadata_hash: Option<Bytes>,
 }
 
 #[contracttype]
@@ -55,6 +102,8 @@ pub struct EscrowCreatedEvent {
     pub amount: i128,
     pub token: Address,
     pub release_window: u32,
+    pub ipfs_hash: Option<String>,
+    pub metadata_hash: Option<Bytes>,
 }
 
 #[contracttype]
@@ -82,6 +131,9 @@ pub struct EscrowDisputedEvent {
 pub struct EscrowResolvedEvent {
     pub escrow_id: u64,
     pub resolution: Resolution,
+pub struct EscrowMetadata {
+    pub ipfs_hash: Option<String>,
+    pub metadata_hash: Option<Bytes>,
 }
 
 /// Platform configuration data
@@ -99,6 +151,52 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
+    fn validate_ipfs_cid(cid: &String) -> bool {
+        let len = cid.len() as usize;
+        if len == 0 || len > 128 {
+            return false;
+        }
+
+        let mut buf = [0u8; 128];
+        cid.copy_into_slice(&mut buf[0..len]);
+        let cid_bytes = &buf[0..len];
+
+        let is_v0 = len == 46
+            && cid_bytes[0] == b'Q'
+            && cid_bytes[1] == b'm'
+            && cid_bytes.iter().all(|b| {
+                matches!(
+                    *b,
+                    b'1'..=b'9'
+                        | b'A'..=b'H'
+                        | b'J'..=b'N'
+                        | b'P'..=b'Z'
+                        | b'a'..=b'k'
+                        | b'm'..=b'z'
+                )
+            });
+
+        let is_v1 = len >= 3
+            && cid_bytes[0] == b'b'
+            && cid_bytes[1..]
+                .iter()
+                .all(|b| matches!(*b, b'a'..=b'z' | b'2'..=b'7'));
+
+        is_v0 || is_v1
+    }
+
+    fn validate_optional_ipfs_hash(ipfs_hash: &Option<String>) {
+        if let Some(cid) = ipfs_hash {
+            assert!(Self::validate_ipfs_cid(cid), "Invalid IPFS CID");
+        }
+    }
+
+    fn validate_optional_metadata_hash(metadata_hash: &Option<Bytes>) {
+        if let Some(hash) = metadata_hash {
+            assert!(hash.len() == 32, "metadata_hash must be 32 bytes");
+        }
+    }
+
     /// Initialize the contract with platform configuration
     /// 
     /// # Arguments
@@ -111,6 +209,10 @@ impl EscrowContract {
         // Validate fee is within bounds
         assert!(platform_fee_bps <= MAX_PLATFORM_FEE_BPS, "Fee too high");
 
+        if !(platform_fee_bps <= MAX_PLATFORM_FEE_BPS) {
+            env.panic_with_error(Error::InvalidFee);
+        }
+        
         let config = PlatformConfig {
             platform_fee_bps,
             platform_wallet: platform_wallet.clone(),
@@ -142,34 +244,77 @@ impl EscrowContract {
         token: Address,
         amount: i128,
         order_id: u32,
-        release_window: Option<u64>,
+        release_window: Option<u32>,
+    ) -> Escrow {
+        Self::create_escrow_with_metadata(
+            env,
+            buyer,
+            seller,
+            token,
+            amount,
+            order_id,
+            release_window,
+            None,
+            None,
+        )
+    }
+
+    /// Create a new escrow for an order and attach off-chain metadata.
+    pub fn create_escrow_with_metadata(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        token: Address,
+        amount: i128,
+        order_id: u32,
+        release_window: Option<u32>,
+        ipfs_hash: Option<String>,
+        metadata_hash: Option<Bytes>,
     ) -> Escrow {
         buyer.require_auth();
         
         // Validate amount is positive
-        assert!(amount > 0, "Amount must be positive");
+        if !(amount > 0) { env.panic_with_error(Error::AmountBelowMinimum); }
         
         // Validate buyer and seller are different
-        assert!(buyer != seller, "Buyer and seller must be different");
+        if !(buyer != seller) { env.panic_with_error(Error::SameBuyerSeller); }
         
         // Default to 7 days if not specified
-        let window = release_window.unwrap_or(604800u64);
-        let created_at = env.ledger().timestamp();
+        let window = release_window.unwrap_or(604800u32);
+        let created_at_u64 = env.ledger().timestamp();
+        assert!(created_at_u64 <= u32::MAX as u64, "Ledger timestamp overflow");
+        let created_at = created_at_u64 as u32;
+        Self::validate_optional_ipfs_hash(&ipfs_hash);
+        Self::validate_optional_metadata_hash(&metadata_hash);
 
         let escrow = Escrow {
+            id: order_id as u64,
             buyer: buyer.clone(),
             seller: seller.clone(),
             token: token.clone(),
             amount,
             status: EscrowStatus::Pending,
-            created_at,
             release_window: window,
+            created_at,
+            ipfs_hash: ipfs_hash.clone(),
+            metadata_hash: metadata_hash.clone(),
         };
 
-        // Store escrow by order_id
         env.storage()
             .persistent()
             .set(&(ESCROW, order_id), &escrow);
+
+        // Update buyer's escrow list for indexing
+        let buyer_key = DataKey::BuyerEscrows(buyer.clone());
+        let mut buyer_escrows: soroban_sdk::Vec<u64> = env.storage().persistent().get(&buyer_key).unwrap_or(soroban_sdk::Vec::new(&env));
+        buyer_escrows.push_back(order_id as u64);
+        env.storage().persistent().set(&buyer_key, &buyer_escrows);
+
+        // Update seller's escrow list for indexing
+        let seller_key = DataKey::SellerEscrows(seller.clone());
+        let mut seller_escrows: soroban_sdk::Vec<u64> = env.storage().persistent().get(&seller_key).unwrap_or(soroban_sdk::Vec::new(&env));
+        seller_escrows.push_back(order_id as u64);
+        env.storage().persistent().set(&seller_key, &seller_escrows);
 
         // Transfer funds from buyer to contract
         let client = token::Client::new(&env, &token);
@@ -181,19 +326,66 @@ impl EscrowContract {
             seller: seller.clone(),
             amount,
             token: token.clone(),
-            release_window: window as u32,
+            release_window: window,
+            ipfs_hash,
+            metadata_hash,
         };
         env.events().publish((Symbol::new(&env, "escrow_created"), order_id as u64), event);
 
         escrow
     }
 
+    /// Get escrows for a specific buyer with pagination.
+    pub fn get_escrows_by_buyer(
+        env: Env,
+        buyer: Address,
+        page: u32,
+        limit: u32,
+    ) -> Result<soroban_sdk::Vec<u64>, Error> {
+        let key = DataKey::BuyerEscrows(buyer);
+        let escrow_ids: soroban_sdk::Vec<u64> = env.storage().persistent().get(&key)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        
+        let start = page * limit;
+        let len = escrow_ids.len();
+        
+        if start >= len {
+            return Ok(soroban_sdk::Vec::new(&env));
+        }
+        
+        let end = (start + limit).min(len);
+        Ok(escrow_ids.slice(start..end))
+    }
+
+    /// Get escrows for a specific seller with pagination.
+    pub fn get_escrows_by_seller(
+        env: Env,
+        seller: Address,
+        page: u32,
+        limit: u32,
+    ) -> Result<soroban_sdk::Vec<u64>, Error> {
+        let key = DataKey::SellerEscrows(seller);
+        let escrow_ids: soroban_sdk::Vec<u64> = env.storage().persistent().get(&key)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        
+        let start = page * limit;
+        let len = escrow_ids.len();
+        
+        if start >= len {
+            return Ok(soroban_sdk::Vec::new(&env));
+        }
+        
+        let end = (start + limit).min(len);
+        Ok(escrow_ids.slice(start..end))
+    }
+
     /// Get platform configuration
     fn get_platform_config(env: &Env) -> PlatformConfig {
-        env.storage()
+        let config = env.storage()
             .persistent()
-            .get(&PLATFORM_FEE)
-            .expect("Platform not initialized")
+            .get(&PLATFORM_FEE);
+        if !(config.is_some()) { env.panic_with_error(Error::PlatformNotInitialized); }
+        config.unwrap()
     }
 
     fn get_arbitrator(env: &Env) -> Address {
@@ -210,19 +402,17 @@ impl EscrowContract {
     /// # Arguments
     /// * `order_id` - Order identifier
     pub fn release_funds(env: Env, order_id: u32) {
-        let mut escrow: Escrow = env
+        let escrow_opt = env
             .storage()
             .persistent()
-            .get(&(ESCROW, order_id))
-            .expect("Escrow not found");
+            .get(&(ESCROW, order_id));
+        if !(escrow_opt.is_some()) { env.panic_with_error(Error::EscrowNotFound); }
+        let mut escrow: Escrow = escrow_opt.unwrap();
 
         // Only buyer can release funds
         escrow.buyer.require_auth();
         
-        assert!(
-            escrow.status == EscrowStatus::Pending,
-            "Escrow already processed"
-        );
+        if !(escrow.status == EscrowStatus::Pending) { env.panic_with_error(Error::InvalidEscrowState); }
 
         // Get platform config
         let config = Self::get_platform_config(&env);
@@ -273,24 +463,19 @@ impl EscrowContract {
     /// # Arguments
     /// * `order_id` - Order identifier
     pub fn auto_release(env: Env, order_id: u32) {
-        let mut escrow: Escrow = env
+        let escrow_opt = env
             .storage()
             .persistent()
-            .get(&(ESCROW, order_id))
-            .expect("Escrow not found");
+            .get(&(ESCROW, order_id));
+        if !(escrow_opt.is_some()) { env.panic_with_error(Error::EscrowNotFound); }
+        let mut escrow: Escrow = escrow_opt.unwrap();
 
-        assert!(
-            escrow.status == EscrowStatus::Pending,
-            "Escrow already processed"
-        );
+        if !(escrow.status == EscrowStatus::Pending) { env.panic_with_error(Error::InvalidEscrowState); }
 
         let current_time = env.ledger().timestamp();
-        let elapsed = current_time - escrow.created_at;
+        let elapsed = current_time - (escrow.created_at as u64);
 
-        assert!(
-            elapsed >= escrow.release_window,
-            "Release window not yet elapsed"
-        );
+        if !(elapsed >= escrow.release_window as u64) { env.panic_with_error(Error::ReleaseWindowNotElapsed); }
 
         // Get platform config
         let config = Self::get_platform_config(&env);
@@ -344,23 +529,20 @@ impl EscrowContract {
     pub fn refund(env: Env, order_id: u32, authorized_address: Address) {
         authorized_address.require_auth();
         
-        let mut escrow: Escrow = env
+        let escrow_opt = env
             .storage()
             .persistent()
-            .get(&(ESCROW, order_id))
-            .expect("Escrow not found");
+            .get(&(ESCROW, order_id));
+        if !(escrow_opt.is_some()) { env.panic_with_error(Error::EscrowNotFound); }
+        let mut escrow: Escrow = escrow_opt.unwrap();
 
         // Only buyer or platform can refund
-        assert!(
-            escrow.buyer == authorized_address || 
-            authorized_address == env.current_contract_address(), // Platform check
-            "Not authorized to refund"
-        );
+        if !(escrow.buyer == authorized_address || 
+            authorized_address == env.current_contract_address()) {
+            env.panic_with_error(Error::Unauthorized);
+        }
 
-        assert!(
-            escrow.status == EscrowStatus::Pending,
-            "Escrow already processed"
-        );
+        if !(escrow.status == EscrowStatus::Pending) { env.panic_with_error(Error::InvalidEscrowState); }
 
         // Update status
         escrow.status = EscrowStatus::Refunded;
@@ -411,10 +593,20 @@ impl EscrowContract {
     /// # Arguments
     /// * `order_id` - Order identifier
     pub fn get_escrow(env: Env, order_id: u32) -> Escrow {
-        env.storage()
+        let escrow_opt = env.storage()
             .persistent()
-            .get(&(ESCROW, order_id))
-            .expect("Escrow not found")
+            .get(&(ESCROW, order_id));
+        if !(escrow_opt.is_some()) { env.panic_with_error(Error::EscrowNotFound); }
+        escrow_opt.unwrap()
+    }
+
+    /// Get escrow metadata fields only.
+    pub fn get_escrow_metadata(env: Env, order_id: u32) -> EscrowMetadata {
+        let escrow = Self::get_escrow(env, order_id);
+        EscrowMetadata {
+            ipfs_hash: escrow.ipfs_hash,
+            metadata_hash: escrow.metadata_hash,
+        }
     }
 
     /// Check if escrow can be auto-released
@@ -422,20 +614,21 @@ impl EscrowContract {
     /// # Arguments
     /// * `order_id` - Order identifier
     pub fn can_auto_release(env: Env, order_id: u32) -> bool {
-        let escrow: Escrow = env
+        let escrow_opt = env
             .storage()
             .persistent()
-            .get(&(ESCROW, order_id))
-            .expect("Escrow not found");
+            .get(&(ESCROW, order_id));
+        if !(escrow_opt.is_some()) { env.panic_with_error(Error::EscrowNotFound); }
+        let escrow: Escrow = escrow_opt.unwrap();
 
         if escrow.status != EscrowStatus::Pending {
             return false;
         }
 
         let current_time = env.ledger().timestamp();
-        let elapsed = current_time - escrow.created_at;
+        let elapsed = current_time - (escrow.created_at as u64);
 
-        elapsed >= escrow.release_window
+        elapsed >= escrow.release_window as u64
     }
 
     /// Dispute an escrow
@@ -446,24 +639,21 @@ impl EscrowContract {
     pub fn dispute_escrow(env: Env, order_id: u32, authorized_address: Address) {
         authorized_address.require_auth();
 
-        let mut escrow: Escrow = env
+        let escrow_opt = env
             .storage()
             .persistent()
-            .get(&(ESCROW, order_id))
-            .expect("Escrow not found");
+            .get(&(ESCROW, order_id));
+        if !(escrow_opt.is_some()) { env.panic_with_error(Error::EscrowNotFound); }
+        let mut escrow: Escrow = escrow_opt.unwrap();
 
         let config = Self::get_platform_config(&env);
 
         // Allow buyer or admin to dispute
-        assert!(
-            escrow.buyer == authorized_address || authorized_address == config.admin,
-            "Not authorized to dispute"
-        );
+        if !(escrow.buyer == authorized_address || authorized_address == config.admin) {
+            env.panic_with_error(Error::Unauthorized);
+        }
 
-        assert!(
-            escrow.status == EscrowStatus::Pending,
-            "Escrow already processed"
-        );
+        if !(escrow.status == EscrowStatus::Pending) { env.panic_with_error(Error::InvalidEscrowState); }
 
         escrow.status = EscrowStatus::Disputed;
         env.storage()
@@ -520,7 +710,7 @@ impl EscrowContract {
         let config = Self::get_platform_config(&env);
         config.admin.require_auth();
         
-        assert!(new_fee_bps <= MAX_PLATFORM_FEE_BPS, "Fee too high");
+        if !(new_fee_bps <= MAX_PLATFORM_FEE_BPS) { env.panic_with_error(Error::InvalidFee); }
         
         let new_config = PlatformConfig {
             platform_fee_bps: new_fee_bps,
